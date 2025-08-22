@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Email Webapp</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}" />
+</head>
+<body>
+  <nav>
+    <div class="container">
+      <a href="{{ url_for('inbox') }}" style="color:#e2e8f0;font-weight:600;">📥 Inbox</a>
+      <a href="{{ url_for('compose') }}" style="color:#e2e8f0;font-weight:600;margin-left:12px;">✉️ Compose</a>
+    </div>
+  </nav>
+  <div class="container">
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+      <div class="card">{% for m in messages %}<div>{{ m }}</div>{% endfor %}</div>
+      {% endif %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>
