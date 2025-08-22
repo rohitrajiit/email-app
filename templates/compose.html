@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2 style="margin-top:0;">Compose Email</h2>
+  <form method="post" action="{{ url_for('send_mail') }}" enctype="multipart/form-data">
+    <label>To</label><input type="email" name="to" required>
+    <div style="margin-top:10px;"><label>Subject</label><input type="text" name="subject" required></div>
+    <div style="margin-top:10px;"><label>Body</label><textarea name="body" rows="10" required></textarea></div>
+    <div style="margin-top:10px;"><label>Attachments</label><input type="file" name="attachments" multiple></div>
+    <div style="margin-top:14px;"><button type="submit">Send</button></div>
+  </form>
+</div>
+{% endblock %}

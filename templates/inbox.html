@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2 style="margin-top:0;">Inbox</h2>
+  <form method="get" action="{{ url_for('inbox') }}" style="display:flex;gap:8px;margin:10px 0;">
+    <input type="text" name="q" value="{{ request.args.get('q','') }}" placeholder="Search subject/from">
+    <select name="limit" style="max-width:120px">
+      {% for n in [10,25,50,100] %}<option value="{{n}}" {% if request.args.get('limit','25')|int==n %}selected{% endif %}>Show {{n}}</option>{% endfor %}
+    </select>
+    <button type="submit">Search</button>
+  </form>
+  <table>
+    <tr><th>From</th><th>Subject</th><th>Date</th></tr>
+    {% for m in emails %}
+      <tr>
+        <td>{{ m.from }}</td>
+        <td><a href="{{ url_for('view_message', uid=m.uid) }}">{{ m.subject }}</a></td>
+        <td class="small">{{ m.date }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="3">No messages found.</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}

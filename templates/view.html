@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2 style="margin-top:0;">{{ message.subject }}</h2>
+  <div class="small"><b>From:</b> {{ message.from }} • <b>Date:</b> {{ message.date }}</div>
+  {% if message.text %}<h3>Text</h3><pre>{{ message.text }}</pre>{% endif %}
+  {% if message.html %}<h3>HTML</h3><iframe class="email-body" sandbox="allow-forms allow-popups allow-same-origin" srcdoc="{{ message.html|safe }}"></iframe>{% endif %}
+</div>
+{% endblock %}
