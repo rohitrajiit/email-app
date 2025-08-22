@@ -1,265 +1,158 @@
-import os
-import re
-import imaplib
-import smtplib
-import mimetypes
-from email import policy
-from email.utils import formatdate, make_msgid, getaddresses
-from email.header import decode_header
-from email.parser import BytesParser
-from email.message import EmailMessage
-from flask import Flask, render_template, request, redirect, url_for, flash
+import os, imaplib, smtplib
+from email import message_from_bytes
+from email.header import decode_header, make_header
+from email.utils import parseaddr, formatdate
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+from flask import Flask, render_template, request, redirect, url_for, flash, send_file
+from io import BytesIO
 from dotenv import load_dotenv
 
 load_dotenv()
-
 app = Flask(__name__)
-app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev")
+app.secret_key = os.environ.get("FLASK_SECRET_KEY","dev")
 
-# IMAP/SMTP config
-IMAP_HOST = os.getenv("IMAP_HOST")
-IMAP_PORT = int(os.getenv("IMAP_PORT", 993))
-IMAP_USER = os.getenv("IMAP_USERNAME")
-IMAP_PASS = os.getenv("IMAP_PASSWORD")
-IMAP_FOLDER = os.getenv("IMAP_FOLDER", "INBOX")
+EMAIL = os.environ.get("EMAIL_ADDRESS")
+PASS = os.environ.get("EMAIL_PASSWORD")
+IMAP_SERVER = os.environ.get("IMAP_SERVER","imap.gmail.com")
+IMAP_PORT = int(os.environ.get("IMAP_PORT","993"))
+SMTP_SERVER = os.environ.get("SMTP_SERVER","smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT","465"))
+MAILBOX = os.environ.get("MAILBOX","INBOX")
 
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 465))
-SMTP_USER = os.getenv("SMTP_USERNAME")
-SMTP_PASS = os.getenv("SMTP_PASSWORD")
-SMTP_ENC  = os.getenv("SMTP_ENCRYPTION", "ssl").lower()  # 'ssl' or 'starttls'
-FROM_NAME = os.getenv("FROM_NAME", "")
-FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
+def _dec(s):
+    if not s: return ""
+    try: return str(make_header(decode_header(s)))
+    except: return s
 
-# ---------- Helpers ----------
+def _addr(s):
+    name, addr = parseaddr(s or "")
+    return f"{name} <{addr}>" if name else addr
 
-def _decode_header(value: str) -> str:
-    if not value:
-        return ""
-    parts = decode_header(value)
-    decoded = []
-    for text, enc in parts:
-        if isinstance(text, bytes):
-            try:
-                decoded.append(text.decode(enc or "utf-8", errors="replace"))
-            except Exception:
-                decoded.append(text.decode("utf-8", errors="replace"))
-        else:
-            decoded.append(text)
-    return "".join(decoded)
+def imap_conn():
+    m = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    m.login(EMAIL, PASS)
+    return m
 
-
-def _html_to_text(html: str) -> str:
-    # Lightweight HTML → text for previews
-    text = re.sub(r"<br\s*/?>", "\n", html, flags=re.I)
-    text = re.sub(r"<p[^>]*>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", "", text)
-    return re.sub(r"\n+", "\n", text).strip()
-
-
-def fetch_inbox(limit=25):
-    """Return a list of dicts: [{uid, subject, from, date, snippet}]"""
-    msgs = []
-    with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as M:
-        M.login(IMAP_USER, IMAP_PASS)
-        typ, _ = M.select(IMAP_FOLDER)
-        if typ != 'OK':
-            raise RuntimeError("Cannot select folder")
-
-        typ, data = M.uid('search', None, 'ALL')
-        if typ != 'OK' or not data or not data[0]:
-            return []
-
-        uids = data[0].split()
-        for uid in reversed(uids[-limit:]):  # newest first
-            typ, msg_data = M.uid('fetch', uid, '(BODY.PEEK[])')
-            if typ != 'OK' or not msg_data or not msg_data[0]:
-                continue
-            raw = msg_data[0][1]
-            msg = BytesParser(policy=policy.default).parsebytes(raw)
-
-            subject = _decode_header(msg['subject'])
-            from_ = _decode_header(msg.get('from', ''))
-            date = msg.get('date', '')
-
-            # Extract a preview
-            snippet = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    ctype = part.get_content_type()
-                    disp = (part.get('Content-Disposition') or '').lower()
-                    if ctype == 'text/plain' and 'attachment' not in disp:
-                        try:
-                            snippet = part.get_content().strip()
-                            break
-                        except Exception:
-                            pass
-                if not snippet:
-                    for part in msg.walk():
-                        ctype = part.get_content_type()
-                        disp = (part.get('Content-Disposition') or '').lower()
-                        if ctype == 'text/html' and 'attachment' not in disp:
-                            try:
-                                snippet = _html_to_text(part.get_content())
-                                break
-                            except Exception:
-                                pass
-            else:
-                ctype = msg.get_content_type()
-                if ctype == 'text/plain':
-                    snippet = msg.get_content().strip()
-                elif ctype == 'text/html':
-                    snippet = _html_to_text(msg.get_content())
-
-            snippet = (snippet or "").replace("\r", "\n").splitlines()
-            snippet = " ".join(line.strip() for line in snippet if line.strip())
-            if len(snippet) > 200:
-                snippet = snippet[:200] + "…"
-
-            msgs.append({
-                'uid': uid.decode('ascii'),
-                'subject': subject or '(no subject)',
-                'from': from_,
-                'date': date,
-                'snippet': snippet,
-            })
-    return msgs
-
-
-def fetch_message(uid: str):
-    """Return a dict with headers and best-effort text & html bodies."""
-    with imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT) as M:
-        M.login(IMAP_USER, IMAP_PASS)
-        typ, _ = M.select(IMAP_FOLDER)
-        if typ != 'OK':
-            raise RuntimeError("Cannot select folder")
-        typ, msg_data = M.uid('fetch', uid, '(BODY.PEEK[])')
-        if typ != 'OK' or not msg_data or not msg_data[0]:
-            return None
-        raw = msg_data[0][1]
-        msg = BytesParser(policy=policy.default).parsebytes(raw)
-
-        subject = _decode_header(msg['subject'])
-        from_ = _decode_header(msg.get('from', ''))
-        to_ = _decode_header(msg.get('to', ''))
-        cc_ = _decode_header(msg.get('cc', ''))
-        date = msg.get('date', '')
-
-        text_body = None
-        html_body = None
-
-        if msg.is_multipart():
-            for part in msg.walk():
-                ctype = part.get_content_type()
-                disp = (part.get('Content-Disposition') or '').lower()
-                if ctype == 'text/plain' and 'attachment' not in disp and text_body is None:
-                    try:
-                        text_body = part.get_content().strip()
-                    except Exception:
-                        pass
-                elif ctype == 'text/html' and 'attachment' not in disp and html_body is None:
-                    try:
-                        html_body = part.get_content()
-                    except Exception:
-                        pass
-        else:
-            ctype = msg.get_content_type()
-            if ctype == 'text/plain':
-                text_body = msg.get_content().strip()
-            elif ctype == 'text/html':
-                html_body = msg.get_content()
-
-        if text_body is None and html_body is not None:
-            text_body = _html_to_text(html_body)
-        if html_body is None and text_body is not None:
-            html_body = '<pre class="whitespace-pre-wrap">' + re.escape(text_body) + '</pre>'
-
-        return {
-            'uid': uid,
-            'subject': subject or '(no subject)',
-            'from': from_,
-            'to': to_,
-            'cc': cc_,
-            'date': date,
-            'text': text_body or '',
-            'html': html_body or '',
-        }
-
-
-def send_email(to_field: str, subject: str, body: str, attachment):
-    msg = EmailMessage()
-    msg['Subject'] = subject or ''
-    msg['From'] = f"{FROM_NAME} <{FROM_EMAIL}>" if FROM_NAME else FROM_EMAIL
-    msg['To'] = to_field
-    msg['Date'] = formatdate(localtime=True)
-    msg['Message-ID'] = make_msgid()
-
-    # Plain + HTML (very simple). Clients will display the best available.
-    msg.set_content(body)
-    msg.add_alternative(f"""
-    <html>
-      <body>
-        <div>{body.replace('\n','<br>')}</div>
-      </body>
-    </html>
-    """, subtype='html')
-
-    # Optional single attachment
-    if attachment and attachment.filename:
-        data = attachment.read()
-        ctype, encoding = mimetypes.guess_type(attachment.filename)
-        if ctype is None:
-            maintype, subtype = 'application', 'octet-stream'
-        else:
-            maintype, subtype = ctype.split('/', 1)
-        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=attachment.filename)
-
-    if SMTP_ENC == 'ssl':
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-    else:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.ehlo()
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-
-
-# ---------- Routes ----------
-
-@app.route('/')
+@app.route("/")
 def inbox():
+    q = request.args.get("q","").strip()
+    limit = int(request.args.get("limit","25"))
+    emails = []
     try:
-        messages = fetch_inbox(limit=25)
+        m = imap_conn(); m.select(MAILBOX)
+        crit = 'ALL'
+        if q:
+            crit = f'(OR (HEADER Subject "{q}") (HEADER From "{q}"))'
+        typ, data = m.uid("SEARCH", None, crit)
+        ids = (data[0].split() if typ=="OK" else [])
+        ids = ids[-limit:][::-1]
+        for i in ids:
+            uid = i.decode()
+            typ, d = m.uid("FETCH", uid, "(RFC822.HEADER)")
+            if typ!="OK" or not d or d[0] is None: continue
+            raw = d[0][1]
+            from email import message_from_bytes as mfb
+            msg = mfb(raw)
+            emails.append({
+                "uid": uid,
+                "from": _addr(msg.get("From")),
+                "subject": _dec(msg.get("Subject")) or "(no subject)",
+                "date": msg.get("Date"),
+            })
+        m.logout()
     except Exception as e:
-        flash(f"Error loading inbox: {e}", "error")
-        messages = []
-    return render_template('index.html', messages=messages)
+        flash(f"IMAP error: {e}")
+    return render_template("inbox.html", emails=emails)
 
+def fetch_full(uid):
+    m = imap_conn(); m.select(MAILBOX)
+    typ, data = m.uid("FETCH", uid, "(RFC822)")
+    m.logout()
+    if typ!="OK" or not data or data[0] is None: return None
+    raw = data[0][1]
+    from email import message_from_bytes as mfb
+    msg = mfb(raw)
+    text = html = None
+    atts = []
+    idx = 0
+    if msg.is_multipart():
+        for part in msg.walk():
+            cdisp = (part.get("Content-Disposition") or "").lower()
+            ctype = (part.get_content_type() or "").lower()
+            if ctype=="text/plain" and "attachment" not in cdisp and text is None:
+                text = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="replace")
+            elif ctype=="text/html" and "attachment" not in cdisp and html is None:
+                html = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", errors="replace")
+            elif "attachment" in cdisp or part.get_filename():
+                payload = part.get_payload(decode=True) or b""
+                fname = part.get_filename() or f"attachment-{idx}.bin"
+                atts.append({"part_index": idx, "filename": _dec(fname), "size": len(payload)})
+            idx += 1
+    else:
+        ctype = (msg.get_content_type() or "").lower()
+        payload = msg.get_payload(decode=True) or b""
+        if ctype=="text/plain":
+            text = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+        elif ctype=="text/html":
+            html = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+    return {
+        "uid": uid, "from": _addr(msg.get("From")), "to": _addr(msg.get("To")),
+        "subject": _dec(msg.get("Subject")) or "(no subject)", "date": msg.get("Date"),
+        "text": text, "html": html, "attachments": atts
+    }
 
-@app.route('/email/<uid>')
-def view_email(uid):
-    data = fetch_message(uid)
-    if not data:
-        flash("Message not found", "error")
-        return redirect(url_for('inbox'))
-    return render_template('view.html', m=data)
+@app.route("/message/<uid>")
+def view_message(uid):
+    m = fetch_full(uid)
+    if not m:
+        flash("Message not found"); return redirect(url_for("inbox"))
+    return render_template("view.html", message=m)
 
+@app.route("/attachment/<uid>/<int:idx>")
+def download_attachment(uid, idx):
+    import email as _e
+    m = imap_conn(); m.select(MAILBOX)
+    typ, data = m.uid("FETCH", uid, "(RFC822)"); m.logout()
+    if typ!="OK" or not data or data[0] is None: return ("Not found",404)
+    msg = _e.message_from_bytes(data[0][1])
+    i = 0
+    for part in msg.walk():
+        if i==idx:
+            fname = part.get_filename() or f"attachment-{idx}.bin"
+            payload = part.get_payload(decode=True) or b""
+            return send_file(BytesIO(payload), as_attachment=True, download_name=fname)
+        i += 1
+    return ("Not found",404)
 
-@app.route('/compose', methods=['GET', 'POST'])
+@app.route("/compose")
 def compose():
-    if request.method == 'POST':
-        to_field = (request.form.get('to') or '').strip()
-        subject  = (request.form.get('subject') or '').strip()
-        body     = (request.form.get('body') or '').strip()
-        file     = request.files.get('attachment')
+    return render_template("compose.html")
 
-        # Basic validation for recipient
-        if not to_field:
-            flash('Please enter a recipient email.', 'error')
-            return redirect(url_for('compose'))
+@app.route("/send", methods=["POST"])
+def send_mail():
+    to = request.form.get("to","").strip()
+    subject = request.form.get("subject","").strip()
+    body = request.form.get("body","").strip()
+    if not to or not subject or not body:
+        flash("To, Subject, Body are required"); return redirect(url_for("compose"))
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL; msg["To"] = to; msg["Date"] = formatdate(localtime=True); msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+    for f in request.files.getlist("attachments"):
+        if not f or not f.filename: continue
+        part = MIMEBase("application","octet-stream"); payload = f.read()
+        part.set_payload(payload); encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f'attachment; filename="{f.filename}"')
+        msg.attach(part)
+    try:
+        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT) as s:
+            s.login(EMAIL, PASS); s.sendmail(EMAIL, [to], msg.as_string())
+        flash("Email sent"); return redirect(url_for("inbox"))
+    except Exception as e:
+        flash(f"SMTP error: {e}"); return redirect(url_for("compose"))
 
-        try:
-            send_email(to_field, subject, body, file)
-            flash('Em
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","5000")), debug=True)
